@@ -41,8 +41,11 @@ export interface Attempt {
   label: string
   createdAt: string
   duration: number
-  audioBlob?: Blob
+  /** 录音保存在 IndexedDB 的 audio 存储区，练习主体只保留这个索引 */
+  audioId?: string
   audioMime: string
+  /** 索引存在但音频本体缺失（写入失败或旧备份丢失），标注仍保留，仅无法回听 */
+  audioMissing?: boolean
   simulated: boolean
   rangeStart: number
   rangeEnd: number
@@ -67,5 +70,5 @@ export interface PracticeProject {
 
 export interface PersistedPractice {
   project: PracticeProject
-  version: 1
+  version: 2
 }
