@@ -41,9 +41,12 @@ export interface Attempt {
   label: string
   createdAt: string
   duration: number
-  audioBlob?: Blob
+  /** 录音在 IndexedDB audio store 中的键；模拟轮次为 undefined */
+  audioKey?: string
   audioMime: string
   simulated: boolean
+  /** 有录音索引但音频本体缺失时置位，界面照常展示但标明无法回听 */
+  audioMissing?: boolean
   rangeStart: number
   rangeEnd: number
   scores: GroupScore[]
@@ -65,7 +68,29 @@ export interface PracticeProject {
   updatedAt: string
 }
 
+/** v2：练习主体只含标注、评分与录音索引，音频单独存放在 audio store */
 export interface PersistedPractice {
   project: PracticeProject
+  version: 2
+}
+
+/** v1：旧整包结构，录音 Blob 与练习主体写在一起 */
+export interface LegacyPersistedPractice {
+  project: LegacyProject
   version: 1
+}
+
+export interface LegacyAttempt extends Omit<Attempt, 'audioKey' | 'audioMissing'> {
+  audioBlob?: Blob
+}
+
+export interface LegacyProject extends Omit<PracticeProject, 'attempts'> {
+  attempts: LegacyAttempt[]
+}
+
+export interface AudioRecord {
+  blob: Blob
+  mime: string
+  attemptId: string
+  createdAt: string
 }

@@ -92,13 +92,17 @@ h2 { margin: 3px 0 0; font-size: 19px; font-weight: 800; letter-spacing: -.02em;
 .record-console p { color: #7b8a97; font-size: 11px; text-align: center; }
 .review-column { position: sticky; top: 92px; max-height: calc(100vh - 110px); overflow-y: auto; }
 .attempt-list { display: grid; gap: 7px; }
-.attempt-item { width: 100%; display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 8px; padding: 10px; border: 1px solid #d9e0e5; border-radius: 9px; color: inherit; background: #fff; text-align: left; cursor: pointer; }
+.attempt-item { width: 100%; display: grid; grid-template-columns: 1fr auto; align-items: stretch; gap: 4px; padding: 6px 6px 6px 10px; border: 1px solid #d9e0e5; border-radius: 9px; color: inherit; background: #fff; }
 .attempt-item.active { border-color: #278695; background: #eaf5f6; }
+.attempt-select { display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 8px; min-width: 0; padding: 4px; border: 0; color: inherit; background: transparent; text-align: left; cursor: pointer; }
+.attempt-remove { align-self: center; width: 24px; height: 24px; border: 0; border-radius: 6px; color: #b14a36; background: transparent; font-size: 11px; cursor: pointer; }
+.attempt-remove:hover { background: rgba(214,95,69,.12); }
 .attempt-number { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: #fff; background: #567885; font-size: 11px; font-weight: 800; }
-.attempt-item strong, .attempt-item small { display: block; }
-.attempt-item strong { font-size: 12px; }
-.attempt-item small { margin-top: 3px; color: #81909c; font-size: 10px; }
+.attempt-select strong, .attempt-select small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.attempt-select strong { font-size: 12px; }
+.attempt-select small { margin-top: 3px; color: #81909c; font-size: 10px; }
 .attempt-score { color: #17606b; font-weight: 800; }
+.audio-missing-note { margin: 4px 0 10px; padding: 8px 10px; border: 1px dashed #d65f45; border-radius: 8px; color: #b14a36; background: rgba(214,95,69,.07); font-size: 11px; }
 .playback-card { order: 2; }
 .issues-card { order: 3; }
 .feedback-card { order: 4; }

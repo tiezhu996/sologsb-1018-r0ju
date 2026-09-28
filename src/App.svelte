@@ -2,8 +2,16 @@
   import { onDestroy, onMount } from 'svelte'
   import { ProgressBar } from '@skeletonlabs/skeleton'
   import { createSampleProject } from './sample'
-  import { clearPractice, loadPractice, savePractice } from './storage'
-  import type { Attempt, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
+  import {
+    clearPractice,
+    deleteAttemptAudio,
+    listExistingAudioIds,
+    loadAttemptAudio,
+    loadPractice,
+    saveAttemptAudio,
+    saveProjectBody
+  } from './storage'
+  import type { Attempt, AudioRecord, Intonation, PracticeProject, SenseGroup, StressLevel } from './types'
 
   const intonationOptions: Array<{ value: Intonation; label: string }> = [
     { value: 'fall', label: '下降 ↘' },
@@ -32,14 +40,22 @@
   let audioElement: HTMLAudioElement | undefined
   let playing = false
   let playbackTime = 0
-  let audioUrls = new Map<string, string>()
+  // 每轮音频懒加载缓存：id -> Blob 已加载的播放地址；加载失败 / 缺音频的轮次单独标记。
+  let audioCache = new Map<string, string>()
+  let audioMissingSet = new Set<string>()
+  let audioLoadingId = ''
   let issueWord = ''
   let issueCategory = '声调'
   let issueNote = ''
   let feedbackText = ''
   let newCategory = ''
-  let undoStack: PracticeProject[] = []
-  let redoStack: PracticeProject[] = []
+  interface HistoryEntry {
+    project: PracticeProject
+    /** 跨越“移除轮次”时携带该轮音频；undo 恢复轮次时把音频写回，redo 移除时再清掉 */
+    removedAudio?: Array<{ attemptId: string; blob: Blob; mime: string; createdAt: string }>
+  }
+  let undoStack: HistoryEntry[] = []
+  let redoStack: HistoryEntry[] = []
   let selectedGroup: SenseGroup | undefined
   let selectedAttempt: Attempt | undefined
 
@@ -61,7 +77,7 @@
     mutator(draft)
     draft.updatedAt = new Date().toISOString()
     project = draft
-    undoStack = [...undoStack.slice(-59), before]
+    undoStack = [...undoStack.slice(-59), { project: before }]
     redoStack = []
     scheduleSave()
   }
@@ -70,25 +86,71 @@
     saveStatus = online ? '正在保存…' : '离线编辑中，稍后继续保存'
     window.clearTimeout(saveTimer)
     saveTimer = window.setTimeout(async () => {
-      const target = await savePractice(project)
-      saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份'
+      const target = await saveProjectBody(project)
+      saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份（标注）'
     }, 250)
   }
 
+  function forgetCachedAudio(attemptId: string) {
+    const url = audioCache.get(attemptId)
+    if (url) {
+      URL.revokeObjectURL(url)
+      audioCache.delete(attemptId)
+    }
+  }
+
+  /** 撤销/重做跨回“移除轮次”时，把该轮音频重新写入独立 audio store。 */
+  async function restoreRemovedAudio(entry: HistoryEntry | undefined, target: PracticeProject) {
+    if (!entry?.removedAudio?.length) return
+    await Promise.all(entry.removedAudio.map(async ({ attemptId, blob, mime, createdAt }) => {
+      try {
+        await saveAttemptAudio(attemptId, blob, { mime, createdAt })
+        audioMissingSet.delete(attemptId)
+        forgetCachedAudio(attemptId)
+      } catch {
+        // 音频写回失败只影响这一轮：轮次已回到列表，标注与评分可读，仅标记无法回听。
+        audioMissingSet.add(attemptId)
+        forgetCachedAudio(attemptId)
+        if (target.attempts.some((attempt) => attempt.id === attemptId)) {
+          project = {
+            ...target,
+            attempts: target.attempts.map((attempt) =>
+              attempt.id === attemptId ? { ...attempt, audioMissing: true } : attempt
+            )
+          }
+          void saveProjectBody(project)
+        }
+      }
+    }))
+  }
+
+  /** 撤销/重做跨到“移除轮次”时，清掉该轮音频（可能已通过 undo 重新写回）。 */
+  async function deleteRemovedAudio(entry: HistoryEntry | undefined) {
+    if (!entry?.removedAudio?.length) return
+    for (const { attemptId } of entry.removedAudio) {
+      audioMissingSet.delete(attemptId)
+      forgetCachedAudio(attemptId)
+      await deleteAttemptAudio(attemptId)
+    }
+  }
+
   function undo() {
-    const target = undoStack.pop()
-    if (!target) return
-    redoStack = [...redoStack, clone(project)]
+    const entry = undoStack.pop()
+    if (!entry) return
+    redoStack = [...redoStack, { project: clone(project), removedAudio: entry.removedAudio?.map((item) => ({ ...item, blob: clone(item.blob) })) }]
+    const target = entry.project
     project = target
     scheduleSave()
+    if (entry.removedAudio?.length) void restoreRemovedAudio(entry, target)
   }
 
   function redo() {
-    const target = redoStack.pop()
-    if (!target) return
-    undoStack = [...undoStack, clone(project)]
-    project = target
+    const entry = redoStack.pop()
+    if (!entry) return
+    undoStack = [...undoStack, { project: clone(project), removedAudio: entry.removedAudio?.map((item) => ({ ...item, blob: clone(item.blob) })) }]
+    project = entry.project
     scheduleSave()
+    if (entry.removedAudio?.length) void deleteRemovedAudio(entry)
   }
 
   function selectGroup(groupId: string) {
@@ -203,15 +265,18 @@
     const attemptId = uid('attempt')
     const number = project.attempts.length + 1
     const duration = Number(Math.max(0.5, recordingSeconds).toFixed(1))
+    const createdAt = new Date().toISOString()
     const attempt: Attempt = {
       id: attemptId,
       number,
       label: simulated ? `第 ${number} 轮 · 离线模拟` : `第 ${number} 轮`,
-      createdAt: new Date().toISOString(),
+      createdAt,
       duration,
-      audioBlob: blob,
+      // 录音与练习主体分开保存：这里只写索引，Blob 在下面单独落盘。
+      audioKey: blob ? attemptId : undefined,
       audioMime: blob?.type ?? 'audio/webm',
       simulated,
+      audioMissing: false,
       rangeStart: 0,
       rangeEnd: duration,
       scores: project.groups.map((group) => ({ groupId: group.id, accuracy: 70, rhythm: 70, deviation: 0, note: '' })),
@@ -219,17 +284,71 @@
       feedback: [],
       selfNote: ''
     }
-    if (blob) audioUrls.set(attemptId, URL.createObjectURL(blob))
+    if (blob) audioCache.set(attemptId, URL.createObjectURL(blob))
     editProject((draft) => { draft.attempts.push(attempt) })
     selectedAttemptId = attemptId
     workspaceTab = 'review'
     recordingSeconds = duration
+    if (blob) void persistRecordingAudio(attemptId, blob, createdAt)
   }
 
-  function audioUrlFor(attempt?: Attempt) {
-    if (!attempt?.audioBlob) return ''
-    if (!audioUrls.has(attempt.id)) audioUrls.set(attempt.id, URL.createObjectURL(attempt.audioBlob))
-    return audioUrls.get(attempt.id) ?? ''
+  // 单轮录音独立写入：失败只影响这一轮，其他录音与标注仍可读回。
+  async function persistRecordingAudio(attemptId: string, blob: Blob, createdAt: string) {
+    try {
+      await saveAttemptAudio(attemptId, blob, { mime: blob.type || 'audio/webm', createdAt })
+      saveStatus = '录音与标注已保存到本机'
+    } catch {
+      audioMissingSet.add(attemptId)
+      // 未落盘的内存录音不再保留播放地址，保证界面状态与持久化结果一致（刷新本就会丢）。
+      forgetCachedAudio(attemptId)
+      project = {
+        ...project,
+        attempts: project.attempts.map((item) => (item.id === attemptId ? { ...item, audioMissing: true } : item))
+      }
+      const target = await saveProjectBody(project)
+      saveStatus = target === 'indexeddb'
+        ? '本轮录音写入失败，标注已保存；该轮暂无法回听'
+        : '本轮录音与离线写入失败，标注已存入备份；该轮暂无法回听'
+    }
+  }
+
+  function isAudioMissing(attempt?: Attempt) {
+    if (!attempt || attempt.simulated || !attempt.audioKey) return false
+    return !!attempt.audioMissing || audioMissingSet.has(attempt.id)
+  }
+
+  // 选中某轮时懒加载它的音频；其他轮次不占内存，读不到就标明无法回听。
+  $: if (selectedAttempt?.audioKey && !selectedAttempt.simulated && !selectedAttempt.audioMissing && !audioMissingSet.has(selectedAttempt.id) && !audioCache.has(selectedAttempt.id) && audioLoadingId !== selectedAttempt.id && loaded) {
+    void ensureAttemptAudio(selectedAttempt.id)
+  }
+
+  async function ensureAttemptAudio(attemptId: string) {
+    if (audioLoadingId === attemptId) return
+    audioLoadingId = attemptId
+    const record: AudioRecord | null = await loadAttemptAudio(attemptId)
+    if (record) {
+      if (!audioCache.has(attemptId)) audioCache.set(attemptId, URL.createObjectURL(record.blob))
+      audioMissingSet.delete(attemptId)
+      if (project.attempts.some((attempt) => attempt.id === attemptId && attempt.audioMissing)) {
+        project = {
+          ...project,
+          attempts: project.attempts.map((attempt) =>
+            attempt.id === attemptId ? { ...attempt, audioMissing: false } : attempt
+          )
+        }
+      }
+    } else {
+      audioMissingSet.add(attemptId)
+    }
+    audioLoadingId = ''
+  }
+
+  $: selectedAudioUrl = selectedAttempt && !isAudioMissing(selectedAttempt) ? audioCache.get(selectedAttempt.id) ?? '' : ''
+
+  function audioKindLabel(attempt: Attempt): string {
+    if (attempt.simulated) return '模拟'
+    if (isAudioMissing(attempt)) return '录音缺失·无法回听'
+    return '录音'
   }
 
   function togglePlayback() {
@@ -238,9 +357,11 @@
       stopPlayback()
       return
     }
+    // 模拟轮次没有音频，沿用时间轴模拟播放；缺音频的真实轮次不允许播放。
+    if (isAudioMissing(selectedAttempt)) return
     playing = true
     playbackTime = selectedAttempt.rangeStart
-    const url = audioUrlFor(selectedAttempt)
+    const url = selectedAudioUrl
     if (url && audioElement) {
       audioElement.src = url
       audioElement.currentTime = selectedAttempt.rangeStart
@@ -336,6 +457,35 @@
     })
   }
 
+  // 移除一轮：练习主体去掉该轮（评分、错词、反馈随之退出统计），音频单独清除。
+  // 音频与轮次数据一起进入撤销栈，撤销时整轮连同录音一起回来。
+  async function removeAttempt() {
+    const attempt = selectedAttempt
+    if (!attempt) return
+    if (!confirm(`确定移除「${attempt.label}」吗？该轮录音、评分与反馈将退出统计，可在撤销后一起恢复。`)) return
+    stopPlayback()
+    const index = project.attempts.findIndex((item) => item.id === attempt.id)
+    // 撤销时需要把录音写回，先把这轮 Blob 取进撤销栈；取不到也允许撤销恢复主体（仅无法回听）。
+    let record: AudioRecord | null = null
+    if (attempt.audioKey && !attempt.simulated && !isAudioMissing(attempt)) {
+      record = await loadAttemptAudio(attempt.id)
+    }
+    const removedAudio = record ? [{ attemptId: attempt.id, blob: record.blob, mime: record.mime, createdAt: attempt.createdAt }] : undefined
+    const before = clone(project)
+    const draft = clone(project)
+    draft.attempts = draft.attempts.filter((item) => item.id !== attempt.id)
+    draft.updatedAt = new Date().toISOString()
+    project = draft
+    undoStack = [...undoStack.slice(-59), { project: before, removedAudio }]
+    redoStack = []
+    scheduleSave()
+    forgetCachedAudio(attempt.id)
+    audioMissingSet.delete(attempt.id)
+    await deleteAttemptAudio(attempt.id)
+    const next = project.attempts[index] ?? project.attempts[index - 1]
+    selectedAttemptId = next?.id ?? ''
+  }
+
   function addCategory() {
     if (!newCategory.trim() || project.errorCategories.includes(newCategory.trim())) return
     editProject((draft) => { draft.errorCategories.push(newCategory.trim()) })
@@ -344,7 +494,16 @@
 
   function resetSample() {
     if (!confirm('恢复示例会替换当前练习，确定继续吗？')) return
-    editProject((draft) => { Object.assign(draft, clone(createSampleProject())) })
+    const oldAttemptIds = project.attempts.map((attempt) => attempt.id)
+    const sample = createSampleProject()
+    // 示例轮次没有真实音频，统一标为无法回听。
+    sample.attempts = sample.attempts.map((attempt) =>
+      attempt.simulated ? attempt : { ...attempt, audioKey: undefined, audioMissing: true }
+    )
+    editProject((draft) => { Object.assign(draft, clone(sample)) })
+    oldAttemptIds.forEach(forgetCachedAudio)
+    audioMissingSet.clear()
+    void Promise.all(oldAttemptIds.map(deleteAttemptAudio))
     selectedGroupId = project.groups[0]?.id ?? ''
     selectedAttemptId = project.attempts.at(-1)?.id ?? ''
   }
@@ -353,20 +512,26 @@
     if (!confirm('这会清除本机全部练习、录音与反馈，且不能撤销。')) return
     stopPlayback()
     await clearPractice()
+    audioCache.forEach((url) => URL.revokeObjectURL(url))
+    audioCache = new Map()
+    audioMissingSet.clear()
     const sample = createSampleProject()
+    sample.attempts = sample.attempts.map((attempt) =>
+      attempt.simulated ? attempt : { ...attempt, audioKey: undefined, audioMissing: true }
+    )
     project = sample
     selectedGroupId = sample.groups[0]?.id ?? ''
     selectedAttemptId = sample.attempts.at(-1)?.id ?? ''
     undoStack = []
     redoStack = []
-    await savePractice(project)
+    await saveProjectBody(project)
   }
 
   function onKeydown(event: KeyboardEvent) {
     const command = event.ctrlKey || event.metaKey
     if (command && event.key.toLowerCase() === 's') {
       event.preventDefault()
-      void savePractice(project).then(() => { saveStatus = '已保存到本机' })
+      void saveProjectBody(project).then((target) => { saveStatus = target === 'indexeddb' ? '已保存到本机' : '已保存到离线备份（标注）' })
     } else if (command && event.key.toLowerCase() === 'z') {
       event.preventDefault()
       event.shiftKey ? redo() : undo()
@@ -391,6 +556,34 @@
     online = navigator.onLine
     const saved = await loadPractice()
     if (saved) project = saved
+    // 示例轮次没有真实音频；旧整包迁移或兜底恢复后也核对一遍索引与音频本体。
+    const existing = await listExistingAudioIds()
+    let missingChanged = false
+    project.attempts = project.attempts.map((attempt) => {
+      if (attempt.simulated || !attempt.audioKey) {
+        if (attempt.audioMissing) {
+          missingChanged = true
+          return { ...attempt, audioMissing: false }
+        }
+        return attempt
+      }
+      const hasAudio = existing.has(attempt.id)
+      if (hasAudio) {
+        if (attempt.audioMissing) {
+          missingChanged = true
+          return { ...attempt, audioMissing: false }
+        }
+        return attempt
+      }
+      if (!attempt.audioMissing) missingChanged = true
+      return { ...attempt, audioMissing: true }
+    })
+    if (!saved) {
+      // 首次使用：示例本身也无音频，直接落一份主体，避免后续把缺失标成脏数据。
+      await saveProjectBody(project)
+    } else if (missingChanged) {
+      await saveProjectBody(project)
+    }
     selectedGroupId = project.groups[0]?.id ?? ''
     selectedAttemptId = project.attempts.at(-1)?.id ?? ''
     loaded = true
@@ -405,7 +598,7 @@
     window.clearInterval(recordingTimer)
     window.clearInterval(playbackTimer)
     mediaStream?.getTracks().forEach((track) => track.stop())
-    audioUrls.forEach((url) => URL.revokeObjectURL(url))
+    audioCache.forEach((url) => URL.revokeObjectURL(url))
     window.removeEventListener('keydown', onKeydown)
   })
 </script>
@@ -568,7 +761,7 @@
             <button class:variant-filled-error={recording} class:variant-filled-primary={!recording} class="btn record-button" on:click={() => recording ? stopRecording() : startRecording()}>
               {recording ? '■ 停止并保存尝试' : '● 开始录音'}
             </button>
-            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音仅保存在当前设备 IndexedDB，不会上传。'}</p>
+            <p>{recordingFallback ? '当前浏览器未授权麦克风，将保存一轮可校对的离线模拟记录。' : '录音按轮次单独保存在本机 IndexedDB，不会上传；单轮写入失败只影响这一轮，其他录音与标注仍可读回。'}</p>
           </div>
         </div>
       </section>
@@ -582,12 +775,16 @@
         </div>
         <div class="attempt-list">
           {#each [...project.attempts].reverse() as attempt}
-            <button class:active={attempt.id === selectedAttempt?.id} class="attempt-item" on:click={() => { selectedAttemptId = attempt.id; stopPlayback() }}>
-              <span class="attempt-number">{attempt.number}</span>
-              <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {attempt.simulated ? '模拟' : '录音'}</small></span>
-              <span class="attempt-score">{attempt.scores.length ? Math.round(attempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / attempt.scores.length) : 0}%</span>
-            </button>
+            <div class:active={attempt.id === selectedAttempt?.id} class="attempt-item">
+              <button class="attempt-select" on:click={() => { selectedAttemptId = attempt.id; stopPlayback() }}>
+                <span class="attempt-number">{attempt.number}</span>
+                <span><strong>{attempt.label}</strong><small>{attempt.duration.toFixed(1)}s · {audioKindLabel(attempt)}</small></span>
+                <span class="attempt-score">{attempt.scores.length ? Math.round(attempt.scores.reduce((sum, score) => sum + score.accuracy, 0) / attempt.scores.length) : 0}%</span>
+              </button>
+              <button class="attempt-remove" title="移除这一轮（可撤销）" on:click={() => { selectedAttemptId = attempt.id; void removeAttempt() }}>✕</button>
+            </div>
           {/each}
+          {#if !project.attempts.length}<p class="empty-copy">还没有练习轮次，去录下第一轮吧。</p>{/if}
         </div>
       </div>
 
@@ -595,9 +792,20 @@
         <div class:recommended={workspaceTab !== 'progress'} class="card playback-card">
           <div class="section-heading">
             <div><span class="eyebrow">COMPARE</span><h2>回听与偏差</h2></div>
-            <button class="btn btn-sm variant-filled-primary" on:click={togglePlayback}>{playing ? '■ 停止' : '▶ 播放范围'}</button>
+            {#if isAudioMissing(selectedAttempt)}
+              <span class="btn btn-sm" aria-disabled="true">🔇 无法回听</span>
+            {:else if audioLoadingId === selectedAttempt.id}
+              <span class="btn btn-sm">音频读取中…</span>
+            {:else}
+              <button class="btn btn-sm variant-filled-primary" on:click={togglePlayback}>{playing ? '■ 停止' : '▶ 播放范围'}</button>
+            {/if}
           </div>
-          <audio bind:this={audioElement} src={audioUrlFor(selectedAttempt)} on:timeupdate={onAudioTimeUpdate} on:ended={stopPlayback}></audio>
+          {#if isAudioMissing(selectedAttempt)}
+            <p class="audio-missing-note">这一轮的录音索引还在（评分、错词与反馈可照常查看），但本机音频本体缺失，暂时无法回听；可保留标注继续练习。</p>
+          {/if}
+          {#if !isAudioMissing(selectedAttempt)}
+            <audio bind:this={audioElement} src={selectedAudioUrl} on:timeupdate={onAudioTimeUpdate} on:ended={stopPlayback}></audio>
+          {/if}
           <div class="playback-timeline">
             <div class="playhead" style={`left:${selectedAttempt.duration ? Math.min(100, playbackTime / selectedAttempt.duration * 100) : 0}%`}></div>
             <span class="range-fill" style={`left:${selectedAttempt.duration ? selectedAttempt.rangeStart / selectedAttempt.duration * 100 : 0}%;right:${selectedAttempt.duration ? 100 - selectedAttempt.rangeEnd / selectedAttempt.duration * 100 : 0}%`}></span>
